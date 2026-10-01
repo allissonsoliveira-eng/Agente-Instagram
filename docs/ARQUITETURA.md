@@ -117,6 +117,14 @@ Implementadas na **Guarda de Conformidade**: toda mensagem de saída passa por e
 - **A API pública não oferece esse evento.** Os campos de webhook do Instagram são `comments`, `live_comments`, `mentions`, `message_echoes`, `message_reactions`, `messages`, `messaging_handover`, `messaging_optins`, `messaging_policy_enforcement`, `messaging_postbacks`, `messaging_referral`, `messaging_seen`, `response_feedback`, `standby` e `story_insights`. Nenhum deles avisa sobre novos seguidores.
 - **Não usar alternativas não oficiais** (scraping ou polling da lista de seguidores, automação de navegador). Elas violam os termos da Meta e podem levar ao bloqueio da conta do cliente.
 
+**Como poderíamos ter acesso (o caminho do ManyChat):** o ManyChat não usa um truque técnico. O recurso é um **beta controlado pela Meta**, e o ManyChat recebe o evento por ser **parceiro oficial da Meta (Meta Business Partner)**. As contas também precisam ser conectadas pelo fluxo novo de conexão do Instagram ("Unified Instagram onboarding"). Para chegar lá:
+1. Publicar o app com Login do Instagram e passar pelo **App Review** com acesso avançado às permissões de mensagens e comentários.
+2. Ter clientes e volume de mensagens reais na plataforma.
+3. Candidatar-se ao **Meta Business Partners** (especialidade em mensagens) ou ao programa de **Tech Provider**, e pedir ao gerente de parceria acesso ao beta de "Follow to DM" ou ao evento de seguidor.
+4. Acompanhar o [changelog da Meta](https://developers.facebook.com/docs/instagram-platform/changelog): se o evento entrar na API pública, basta ligar o gatilho.
+
+Não há garantia de aceite nem prazo; a decisão é só da Meta.
+
 **Como a plataforma lida com isso:**
 1. **Gatilho `NEW_FOLLOWER` já previsto no modelo**, mas desligado. Ele será ativado se a Meta abrir o evento na API pública ou se conseguirmos acesso como parceiro. Quando existir, aplicar o limite de 1 mensagem por pessoa por semana.
 2. **"Exigir seguir" (follow gate)**, que funciona hoje pela API oficial. Quando um lead aciona uma automação (comentário, DM, story), a plataforma consulta o perfil dele (`is_user_follow_business` na User Profile API de mensagens). Se ele ainda não segue a conta, recebe "Siga a gente e toque em *Já segui* para receber o material"; o botão consulta o perfil de novo. É o que o ManyChat também faz para crescer seguidores.
