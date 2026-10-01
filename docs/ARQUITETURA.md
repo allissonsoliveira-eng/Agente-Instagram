@@ -89,7 +89,7 @@ O webhook identifica **qual conta** recebeu o evento (`entry.id` = ID da conta d
 | Painel + API | Next.js (App Router) | Dashboard e rotas de webhook no mesmo projeto |
 | Banco | PostgreSQL + Prisma | Relacional, multi-tenant, JSON para fluxo e dados do lead |
 | Filas | Redis + BullMQ | Webhook responde rápido; retries; rate limit por conta |
-| IA | Claude API (`@anthropic-ai/sdk`) com saída estruturada | Resposta + campos coletados + decisão de qualificação em JSON validado |
+| IA | Harness próprio, multi-provedor com chave do cliente: Anthropic (`@anthropic-ai/sdk`, padrão `claude-opus-5-5`), OpenAI e Google | Mesmo desenho do agente do CRM; ferramentas só registram a intenção e o código valida |
 | Auth do painel | Auth.js ou Supabase Auth | Usuários e papéis por workspace |
 | Segredos | Tokens dos canais criptografados no banco (AES-GCM, chave em env/KMS) | Tokens de acesso da Meta são sensíveis |
 | Deploy | Web (Vercel/Render/Fly) + worker separado + Postgres e Redis gerenciados | O worker precisa rodar continuamente |
@@ -162,25 +162,105 @@ O estado do fluxo fica na conversa (`automationId`, `stepIndex`, `awaitingField`
 
 ---
 
-## 6. Agentes de IA e qualificação
+## 6. Agentes de IA: cadastro e harness
 
-- **Modelo:** Claude (Opus 5.5 por padrão, configurável por agente), com **saída estruturada** (`output_config.format` + Zod), para que a resposta sempre volte em JSON válido:
+O agente segue o mesmo desenho do agente do **CRM** (`allissonsoliveira-eng/crm`, pasta `lib/agente/`): mesmos campos de cadastro, mesmo harness próprio (sem framework de agentes) e as mesmas garantias de segurança. Por cima disso, acrescenta o que o Instagram e a qualificação de leads pedem. A ideia é que, com o tempo, o núcleo do harness vire um **pacote compartilhado** entre os dois projetos.
 
-```ts
-{
-  reply: string,                         // texto a enviar ao lead (curto, 1 pergunta por vez)
-  collected: { field: string, value: string }[], // campos de qualificação extraídos
-  score: number,                         // 0–100
-  qualified: boolean,
-  handoff_to_human: boolean,
-  reason: string                         // justificativa curta (fica no log, não vai para o lead)
-}
-```
+### 6.1 Cadastro do agente
 
-- **Prompt do sistema:** é montado a partir da persona do agente, do tom de voz, das regras do canal ("mensagens curtas", "não invente preço", "ofereça falar com humano"), dos critérios de qualificação e da base de conhecimento. Fica estável para aproveitar o **prompt caching**.
-- **Histórico:** as últimas N mensagens da conversa e os dados do lead já coletados.
-- **Qualificação:** um lead é `QUALIFICADO` quando o agente diz que sim **e** a regra do workspace confirma (campos obrigatórios preenchidos e score ≥ limite). Isso evita que um erro do modelo envie lixo para o CRM.
-- **Recusas e falhas:** se o modelo recusar ou der erro, a plataforma envia uma mensagem de segurança e transfere para um humano.
+| Campo | Limite | Como entra no prompt |
+|---|---|---|
+| **Nome do agente** | 60 | Abertura: "Você é {nome}, assistente da {empresa} no Instagram…" |
+| **Instruções** | 20.000 | `## Quem você é e o que faz` |
+| **Regras** (uma por linha) | 10.000 | `## Regras (obrigatórias)`, depois das regras fixas da plataforma e das regras do canal |
+| **Conhecimento da empresa** | 60.000 inline | `## Conhecimento da empresa`. Arquivos e links vão para uma base de busca (6.4) |
+| **Roteiro do funil** | 20.000 + etapas | `## Roteiro do funil` com a orientação geral e as **etapas estruturadas** (6.3) |
+| **Campos do lead** | até 30 | Viram a ferramenta `preencher_campo` (enum dos campos e formato de cada tipo) |
+| IA: provedor, chave, modelo, esforço | — | Chave própria do cliente (BYOK): Anthropic, OpenAI ou Google. Chave criptografada com AES-256-GCM e só os 4 últimos dígitos visíveis |
+| Funcionamento | — | Contas atendidas; modo **Rascunho** ou **Automático** por conta; janela de agrupamento; divisão de mensagens; travas; quem avisar e quando |
+
+O cadastro tem **versões**: cada vez que é salvo, gera uma nova versão. A execução registra qual versão respondeu, e é possível voltar para uma versão anterior. O CRM não tem isso.
+
+Abas da tela: Configuração · Roteiro do funil · Campos e qualificação · Simulador · Respostas.
+
+### 6.2 Uma rodada do harness, do começo ao fim
+
+1. **Agrupamento das mensagens.** Cada mensagem recebida agenda um job `agente_responder` daqui a N segundos (15 por padrão). Se chegar outra mensagem antes, o job é adiado, e várias mensagens seguidas viram uma resposta só. É o mesmo mecanismo do CRM.
+2. **Portões.** O job só segue se a conversa está com o agente, o agente está ligado, a chave existe, o contato não pediu para sair, a **janela de 24h está aberta** e a última mensagem é do contato.
+3. **Contexto, em transação de leitura:**
+   - **Histórico:** as últimas 100 mensagens, com teto de cerca de 40 mil caracteres. Quando passa disso, entra um **resumo** da parte antiga, gerado em segundo plano e guardado na conversa. O CRM só corta o histórico.
+   - **Memória:** os dados do lead (campos preenchidos), a etapa atual do roteiro, as tags e a origem (que automação, que post, que palavra-chave).
+4. **Prompt**, na ordem pensada para o cache. Primeiro a parte fixa (bloco com `cache_control`):
+   1. Abertura com o nome do agente.
+   2. Instruções.
+   3. Regras: regras da plataforma, regras do canal Instagram e regras do cliente.
+   4. Roteiro do funil.
+   5. Conhecimento da empresa.
+
+   Depois vem a parte que muda a cada rodada, `## Contexto desta conversa`:
+   - data e hora;
+   - origem do lead;
+   - etapa atual, com o objetivo dela, o que falta descobrir e o critério para avançar;
+   - "O que já sabemos do lead" (`- campo: valor`);
+   - trechos da base de conhecimento que a busca encontrou;
+   - o tempo que ainda resta da janela de 24h.
+5. **Loop de ferramentas.** No máximo 4 rodadas; na última, `tool_choice: none`. Timeout de 45 s, abaixo do limite do job. As ferramentas **só registram a intenção**: são validadas e normalizadas, devolvem `ok` ou `erro: …` para o modelo se corrigir, e nada é gravado durante a chamada (como no CRM). Ferramentas disponíveis:
+   - `preencher_campo {campo, valor}`
+   - `avancar_etapa {etapa}`: só aceita a próxima etapa e só se o critério de saída for atendido. Os campos obrigatórios da etapa são checados no código, não deixados para o modelo.
+   - `enviar_botoes {texto, opcoes[]}` e `enviar_link {link_id}`: só links cadastrados no conhecimento.
+   - `marcar_qualificado {resumo}`: o código confere o score e os campos obrigatórios antes de aceitar.
+   - `passar_para_humano {motivo, resumo}`: o resumo é interno; o lead não vê.
+   - `criar_tarefa {titulo, quando}`
+6. **Gravação, em transação de escrita:**
+   - Trava a conversa. Se chegou ou saiu alguma mensagem enquanto o agente pensava, a resposta é **descartada** (concorrência otimista).
+   - Passa pelas **travas**: frases proibidas e texto com cara de anotação interna.
+   - Passa pela **guarda de conformidade do Instagram**: janela de 24h, opt-out e limite de envios por hora.
+   - **Rascunho:** salva o texto com as ações; a equipe aprova e escolhe quais ações aplicar.
+   - **Automático:** grava a mensagem e aplica as ações (cada uma num SAVEPOINT, a passagem para humano por último). Depois entrega na fila `outbound`.
+7. **Envio no Instagram.** A resposta é dividida em até 3 mensagens curtas, com uma pequena pausa entre elas e o indicador de "digitando". Os botões viram respostas rápidas. O CRM não faz essa divisão.
+8. **Registro.** Cada rodada grava uma linha em `agente_execucoes`: provedor, modelo, versão do agente, resultado (`enviada | rascunho | trava | descartada | humano | erro`), tokens de entrada, saída e cache, ações e etapa antes e depois. A aba **Respostas** mostra isso.
+9. **Erros.** Seguem a mesma classificação do CRM:
+   - `limite` e `fora_do_ar` voltam para a fila com backoff.
+   - `chave_recusada`, `modelo_invalido` e `recusou` viram execução com erro e avisam a equipe.
+   - Na Anthropic, os modelos novos usam `fallbacks: "default"`.
+
+### 6.3 Roteiro do funil estruturado
+
+O CRM guarda o roteiro como um texto livre por funil. Aqui ele tem **duas partes**:
+
+- **Orientação geral** (texto livre), como no CRM.
+- **Etapas**, cada uma com:
+  - `nome`
+  - `objetivo`
+  - `descobrir`: os campos que a etapa deve preencher
+  - `avança quando`: um critério verificável (campos obrigatórios + score mínimo opcional)
+  - `ações ao avançar`: tag, marcar qualificado, enviar ao CRM, avisar a equipe, tarefa
+
+O agente vê **todas** as etapas no prompt fixo, que fica em cache, e a **etapa atual em destaque** no contexto. O código, não o modelo, decide se ele pode avançar. As etapas também alimentam o funil do dashboard: quantos leads há em cada uma.
+
+Exemplo SDR: Abertura → Descoberta → Qualificação → Próximo passo → Encerramento.
+
+### 6.4 Conhecimento da empresa
+
+- **Até cerca de 60 mil caracteres:** fica inline no prompt fixo, que vai para o cache. É igual ao CRM e é barato por causa do cache.
+- **Arquivos (PDF), páginas do site e textos maiores:** são divididos em trechos e indexados (Postgres + `pgvector`). A cada rodada, os trechos mais relevantes para a última mensagem entram no contexto. Essa parte é a fase 2 do agente.
+
+### 6.5 Regras fixas da plataforma
+
+Vão sempre no prompt, antes das regras do cliente:
+
+- Tudo o que você escreve vai para o lead; nunca escreva notas internas.
+- Mensagens curtas no estilo Direct; uma pergunta por vez.
+- Não invente preço, prazo ou condição. O que não estiver no conhecimento, diga que vai confirmar com a equipe.
+- Se perguntarem, diga que é um assistente virtual.
+- Se o lead pedir para sair, respeite. Se pedir uma pessoa, passe para humano.
+- Não peça senha, dados de cartão nem documentos.
+
+As garantias importantes ficam no **código**, não no prompt: opt-out, janela de 24h, limite por hora, critério de avanço de etapa, critério de qualificação e travas.
+
+### 6.6 Simulador
+
+Permite escolher uma origem (automação ou post) e uma etapa e conversar com o agente. A tela mostra o que o agente faria (as ações), o score, as travas acionadas, os tokens e o uso de cache. **Nada é aplicado.**
 
 ---
 
@@ -200,10 +280,17 @@ O estado do fluxo fica na conversa (`automationId`, `stepIndex`, `awaitingField`
 Workspace 1─N User (papel: owner | admin | atendente)
 Workspace 1─N ChannelAccount (kind, externalId, username/phone, tokenCriptografado,
                               tokenExpiraEm, limitePorHora, status, defaultAgentId)
-Workspace 1─N Agent (nome, instruções, tom, modelo, qualificationSchema JSON,
-                     scoreMinimo, handoffRules JSON, ativo)
-Agent     1─N KnowledgeItem (título, conteúdo/arquivo)
-Agent     N─N ChannelAccount (contas que o agente atende)
+Workspace 1─N Agent (nome ≤60, instrucoes ≤20k, regras ≤10k, conhecimento ≤60k,
+                     provedor, modelo, esforco, chaveCifrada, chaveFinal, ligado,
+                     travas[], avisarQuando[], agruparSegundos, dividirMensagens, versao)
+Agent     1─N AgentVersion (snapshot do cadastro a cada vez que é salvo)
+Agent     1─N AgentFunnel (roteiroGeral ≤20k) 1─N FunnelStage (ordem, nome, objetivo,
+                     camposAlvo[], criterioSaida JSON, acoesAoAvancar JSON)
+Agent     1─N LeadField (rótulo, tipo, opções, obrigatório, pontos, etapa)
+Agent     1─N KnowledgeItem (arquivo/link) 1─N KnowledgeChunk (texto, embedding)
+Agent     1─N AgentExecution (conversa, versão, resultado, tokens, ações, etapaAntes/Depois)
+Conversation 1─1 AgentDraft (texto, ações, alerta)   — modo rascunho
+Agent     N─N ChannelAccount (contas que o agente atende + modo rascunho/automático por conta)
 Workspace 1─N Automation (channelAccountId?, triggerType, keywords[], matchMode, mediaIds[],
                           flow JSON, prioridade, ativa, contadores)
 ChannelAccount 1─N Contact (externalId, username, nome, optedOut, lastInboundAt)
@@ -246,9 +333,14 @@ src/
   automation/
     match.ts                 # normalização + casamento de palavra-chave
     flow.ts                  # máquina de passos (pura, testável)
-  agents/
-    prompt.ts                # monta o system prompt
-    run.ts                   # chamada ao Claude com saída estruturada
+  agente/                    # harness (mesmo desenho de crm/lib/agente)
+    ia/                      # ClienteDeIa: anthropic.ts, openai.ts, google.ts
+    contexto.ts              # prompt fixo (cacheável) + contexto da conversa
+    ferramentas.ts           # definição das ferramentas + anotador (valida intenção)
+    roteiro.ts               # etapas, critério de saída, avanço
+    conhecimento.ts          # inline + busca em trechos (pgvector)
+    trava.ts                 # travas de saída
+    responder.ts             # job: portões → contexto → loop → gravação → envio
   leads/qualification.ts     # merge de dados + regra de qualificação
   integrations/
     types.ts, dispatcher.ts, webhook.ts, rdstation.ts, hubspot.ts ...
@@ -265,7 +357,7 @@ prisma/schema.prisma
 |---|---|
 | **0. Fundação** | Repositório, Prisma + Postgres, Redis/BullMQ, autenticação, workspaces, criptografia de tokens |
 | **1. Instagram (MVP)** | Conectar **várias contas** do Instagram (OAuth), webhook, automações por comentário e DM, resposta privada e pública, guarda de conformidade, inbox com "assumir conversa" |
-| **2. Agentes de IA** | CRUD de agentes, base de conhecimento, qualificação estruturada, transferência para humano, playground de teste |
+| **2. Agentes de IA** | Cadastro completo (nome, instruções, regras, conhecimento, roteiro por etapas, campos), harness no padrão do CRM (agrupamento, ferramentas que registram intenção, travas, rascunho/automático), simulador, aba Respostas, versões do cadastro |
 | **3. Integrações + Dashboard** | Webhook genérico com HMAC e retries, primeiro CRM nativo, dashboard completo com filtro por conta |
 | **4. WhatsApp** | Adapter da Cloud API, vários números, templates, opt-in |
 | **5. Escala** | Gatilhos de story, A/B de mensagens, relatórios por agente, papéis e permissões finos, App Review da Meta |
