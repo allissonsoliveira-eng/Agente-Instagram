@@ -176,7 +176,7 @@ O agente segue o mesmo desenho do agente do **CRM** (`allissonsoliveira-eng/crm`
 | **Conhecimento da empresa** | 60.000 inline | `## Conhecimento da empresa`. Arquivos e links vão para uma base de busca (6.4) |
 | **Roteiro do funil** | 20.000 + etapas | `## Roteiro do funil` com a orientação geral e as **etapas estruturadas** (6.3) |
 | **Campos do lead** | até 30 | Viram a ferramenta `preencher_campo` (enum dos campos e formato de cada tipo) |
-| IA: provedor, chave, modelo, esforço | — | Chave própria do cliente (BYOK): Anthropic, OpenAI ou Google. Chave criptografada com AES-256-GCM e só os 4 últimos dígitos visíveis |
+| IA: conexão, modelo, esforço, comportamento em falha | — | O agente escolhe uma **Conexão de IA** (6.7) e um dos modelos liberados nela. Não guarda chave própria |
 | Funcionamento | — | Contas atendidas; modo **Rascunho** ou **Automático** por conta; janela de agrupamento; divisão de mensagens; travas; quem avisar e quando |
 
 O cadastro tem **versões**: cada vez que é salvo, gera uma nova versão. A execução registra qual versão respondeu, e é possível voltar para uma versão anterior. O CRM não tem isso.
@@ -262,6 +262,32 @@ As garantias importantes ficam no **código**, não no prompt: opt-out, janela d
 
 Permite escolher uma origem (automação ou post) e uma etapa e conversar com o agente. A tela mostra o que o agente faria (as ações), o score, as travas acionadas, os tokens e o uso de cache. **Nada é aplicado.**
 
+### 6.7 Conexões de IA (cadastro das LLMs)
+
+As chaves dos provedores ficam no nível da **empresa (workspace)**, em uma tela própria, **Conexões de IA**. Os agentes só escolhem uma conexão e um modelo. Isso evita colar a mesma chave em cada agente e centraliza custo, limite e troca de chave.
+
+**Cadastro de uma conexão:**
+1. **Provedor:** Anthropic (Claude), OpenAI ou Google (Gemini). A interface `ClienteDeIa` é a mesma do CRM, com uma implementação por provedor usando o SDK oficial de cada um. Bedrock, Vertex e Azure podem entrar depois como novos provedores.
+2. **Nome da conexão**, por exemplo "Anthropic · principal".
+3. **Chave da API.** É criptografada com AES-256-GCM antes de ir ao banco, usando o id da conexão como dado autenticado adicional (`conexao:{id}`). Depois de salva, só os 4 últimos caracteres aparecem. "Trocar chave" substitui a chave sem precisar mexer nos agentes.
+4. **Testar chave.** Chama a listagem de modelos do provedor (`listarModelos`). A chamada valida a chave e devolve os modelos que ela alcança. Erros são classificados como no CRM: `chave_recusada`, `sem_permissao`, `fora_do_ar`.
+5. **Modelos liberados.** O admin marca quais modelos os agentes podem usar e qual é o padrão. Sugestão para a Anthropic: `claude-opus-5-5` como padrão; `claude-sonnet-5-5` e `claude-haiku-4-5` para respostas mais rápidas e baratas.
+6. **Para que serve a conexão:** conversa dos agentes, busca no conhecimento (embeddings) e transcrição de áudio. A Anthropic não oferece embeddings nem transcrição, então essas duas funções usam uma conexão OpenAI ou Google.
+7. **Limite de gasto mensal (US$)** e o que fazer ao atingir: avisar e passar os agentes para Rascunho, só avisar, ou usar a reserva.
+8. **Conexão reserva.** Se a principal falhar por queda do provedor ou limite de requisições, a resposta é gerada pela reserva. Na Anthropic, além disso, os modelos novos usam o fallback do próprio servidor (`fallbacks: "default"`).
+
+**Status e saúde.** Cada conexão mostra:
+- o estado: conectada, chave recusada, limite atingido ou desativada;
+- quando foi o último teste;
+- os agentes que a usam;
+- o gasto do mês, estimado a partir dos tokens registrados em `agente_execucoes` (entrada, saída e cache) e de uma tabela de preço por modelo mantida na plataforma.
+
+Uma chave recusada gera um aviso para a equipe e passa os agentes daquela conexão para Rascunho.
+
+**Permissões.** Só administradores criam, editam ou veem conexões. A chave nunca volta para o navegador nem aparece em logs.
+
+**Painel de uso** no topo da tela: gasto estimado do mês contra o limite, número de respostas e custo médio por resposta, percentual de tokens lidos do cache e falhas da IA (e quantas a reserva resolveu).
+
 ---
 
 ## 7. Integrações (envio do lead qualificado)
@@ -280,8 +306,11 @@ Permite escolher uma origem (automação ou post) e uma etapa e conversar com o 
 Workspace 1─N User (papel: owner | admin | atendente)
 Workspace 1─N ChannelAccount (kind, externalId, username/phone, tokenCriptografado,
                               tokenExpiraEm, limitePorHora, status, defaultAgentId)
+Workspace 1─N LlmConnection (nome, provedor, chaveCifrada, chaveFinal, modelosLiberados[],
+                     modeloPadrao, usos[conversa|embeddings|transcricao], limiteMensalUsd,
+                     acaoNoLimite, reservaId?, status, testadaEm, ativa)
 Workspace 1─N Agent (nome ≤60, instrucoes ≤20k, regras ≤10k, conhecimento ≤60k,
-                     provedor, modelo, esforco, chaveCifrada, chaveFinal, ligado,
+                     conexaoId, modelo, esforco, acaoNaFalha, ligado,
                      travas[], avisarQuando[], agruparSegundos, dividirMensagens, versao)
 Agent     1─N AgentVersion (snapshot do cadastro a cada vez que é salvo)
 Agent     1─N AgentFunnel (roteiroGeral ≤20k) 1─N FunnelStage (ordem, nome, objetivo,
@@ -322,7 +351,7 @@ Filtros: **conta** (todas, ou uma conta específica de Instagram/WhatsApp) e **p
 ```
 src/
   app/                       # Next.js: painel + rotas
-    (painel)/dashboard, conversas, automacoes, agentes, leads, integracoes, canais
+    (painel)/dashboard, conversas, automacoes, agentes, leads, integracoes, canais, conexoes-ia
     api/webhooks/instagram/route.ts
     api/webhooks/whatsapp/route.ts      # fase 2
   channels/
@@ -335,6 +364,7 @@ src/
     flow.ts                  # máquina de passos (pura, testável)
   agente/                    # harness (mesmo desenho de crm/lib/agente)
     ia/                      # ClienteDeIa: anthropic.ts, openai.ts, google.ts
+    conexoes.ts              # cadastro, criptografia, teste de chave, limite de gasto, reserva
     contexto.ts              # prompt fixo (cacheável) + contexto da conversa
     ferramentas.ts           # definição das ferramentas + anotador (valida intenção)
     roteiro.ts               # etapas, critério de saída, avanço
